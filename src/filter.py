@@ -84,15 +84,10 @@ class SensorFilter:
         self.H = np.vstack((np.eye(self.dim_x), np.eye(self.dim_x)))
 
         # Covariance matrices (Q: measurement, R: state transition)
-        self.Q = 0.01 * np.eye(self.dim_z)
-        self.R = 0.01 * np.eye(self.dim_x)
+        self.Q = 1.0e-5 * np.eye(self.dim_z)
+        self.R = 1.0e-3 * np.eye(self.dim_x)
 
     def sensors_fusion(self, odom, marker):
-
-        if not marker.markers:
-            if DEBUG1:
-                print "No marker detected"
-            return
 
         # Timestamp estimation based on odometry
         self.real_time = (odom.header.stamp.nsecs * 1.0) * 1e-9 + odom.header.stamp.secs
@@ -125,22 +120,39 @@ class SensorFilter:
         self.z[1] = self.T_odom_world2robot[1, 3]
         self.z[2] = atan2(self.T_odom_world2robot[1, 0], self.T_odom_world2robot[0, 0])
 
-        quaternion_cam2marker = (
-            marker.markers[0].pose.pose.orientation.x,
-            marker.markers[0].pose.pose.orientation.y,
-            marker.markers[0].pose.pose.orientation.z,
-            marker.markers[0].pose.pose.orientation.w)
+        if not marker.markers:
+            if DEBUG1:
+                rospy.loginfo("No marker detected")
+            self.H[3, 0] = 0
+            self.H[4, 1] = 0
+            self.H[5, 2] = 0
+        else:
+            self.H[3, 0] = 1
+            self.H[4, 1] = 1
+            self.H[5, 2] = 1
 
-        T_cam2marker = tf.transformations.quaternion_matrix(quaternion_cam2marker)
-        T_cam2marker[0, 3] = marker.markers[0].pose.pose.position.x
-        T_cam2marker[1, 3] = marker.markers[0].pose.pose.position.y
-        T_cam2marker[2, 3] = marker.markers[0].pose.pose.position.z
+            quaternion_cam2marker = (
+                marker.markers[0].pose.pose.orientation.x,
+                marker.markers[0].pose.pose.orientation.y,
+                marker.markers[0].pose.pose.orientation.z,
+                marker.markers[0].pose.pose.orientation.w)
 
-        T_world2marker = self.T_world2cam.dot(T_cam2marker)
+            T_cam2marker = tf.transformations.quaternion_matrix(quaternion_cam2marker)
+            T_cam2marker[0, 3] = marker.markers[0].pose.pose.position.x
+            T_cam2marker[1, 3] = marker.markers[0].pose.pose.position.y
+            T_cam2marker[2, 3] = marker.markers[0].pose.pose.position.z
 
-        self.z[3] = T_world2marker[0, 3]
-        self.z[4] = T_world2marker[1, 3]
-        self.z[5] = atan2(T_world2marker[1, 0], T_world2marker[0, 0])
+            T_world2marker = self.T_world2cam.dot(T_cam2marker)
+
+            self.z[3] = T_world2marker[0, 3]
+            self.z[4] = T_world2marker[1, 3]
+            self.z[5] = atan2(T_world2marker[1, 0], T_world2marker[0, 0])
+
+            # Marker's global-position publisher.
+            self.global_marker_position.linear.x = T_world2marker[0, 3]
+            self.global_marker_position.linear.y = T_world2marker[1, 3]
+            self.global_marker_position.linear.z = T_world2marker[2, 3]
+            self.pub_global_marker_position.publish(self.global_marker_position)
 
         # Extended Kalman Filter
         self.ekf()
@@ -150,12 +162,6 @@ class SensorFilter:
         self.pose_estimate.linear.y = self.mu[1]
         self.pose_estimate.angular.z = self.mu[2]
         self.pub_pose.publish(self.pose_estimate)
-
-        # Marker's global-position publisher.
-        self.global_marker_position.linear.x = T_world2marker[0, 3]
-        self.global_marker_position.linear.y = T_world2marker[1, 3]
-        self.global_marker_position.linear.z = T_world2marker[2, 3]
-        self.pub_global_marker_position.publish(self.global_marker_position)
 
         # Odom's global-position publisher.
         self.global_odom_position.linear.x = self.T_odom_world2robot[0, 3]
