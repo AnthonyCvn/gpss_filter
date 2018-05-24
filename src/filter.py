@@ -40,6 +40,9 @@ class SensorFilter:
         # Robot odom position relative to world coordinate publisher
         self.pub_global_odom_position = rospy.Publisher('/robot0/global_odom_position', Twist, queue_size=1)
 
+        # Robot predicted position relative to world coordinate publisher
+        self.pub_global_model_predicted_position = rospy.Publisher('/robot0/global_model_predicted_position', Twist, queue_size=1)
+
         # TF broadcaster
         self.br = tf.TransformBroadcaster()
 
@@ -55,6 +58,7 @@ class SensorFilter:
         self.pose_estimate = Twist()
         self.global_marker_position = Twist()
         self.global_odom_position = Twist()
+        self.global_model_predicted_position = Twist()
         self.last_odom = Odometry()
 
         # Sensors values storage
@@ -63,6 +67,7 @@ class SensorFilter:
 
         # Initialization and Time variables
         self.initialize = True
+        self.calibrate = True
         self.last_time = 0
         self.real_time = 0
         self.dt = 0
@@ -76,16 +81,21 @@ class SensorFilter:
         self.x = np.zeros((self.dim_x, 1))
         self.u = np.zeros((self.dim_u, 1))
         self.z = np.zeros((self.dim_z, 1))
+        self.z_storage = np.zeros((self.dim_z, 1))
         self.mu = np.zeros((self.dim_x, 1))
+        self.mu_storage = self.mu
         self.last_mu = np.zeros((self.dim_x, 1))
 
         # Extended Kalman Filter matrices
         self.S = 0.1 * np.eye(self.dim_x)
         self.H = np.vstack((np.eye(self.dim_x), np.eye(self.dim_x)))
 
-        # Covariance matrices (Q: measurement, R: state transition)
-        self.Q = 1.0e-5 * np.eye(self.dim_z)
+        # Covariance matrices (Q: measurement (odometry then markers), R: state transition)
+        self.Q = np.diag(np.array([1.0e-3, 1.0e-3, 1.0e-3, 5.0e-3, 5.0e-3, 5.0e-3]))
         self.R = 1.0e-3 * np.eye(self.dim_x)
+
+        # Motion model threshold
+        self.epsilon = 1.0e-6
 
     def sensors_fusion(self, odom, marker):
 
@@ -94,11 +104,16 @@ class SensorFilter:
 
         # Initialization on first triggered data
         if self.initialize:
-            self.initialize = False
             self.last_time = self.real_time
-            if DEBUG0:
-                rospy.loginfo("Filter initialized.")
-            return
+            if not marker.markers:
+                if DEBUG1:
+                    rospy.loginfo("No marker detected")
+                return
+            else:
+                self.initialize = False
+                if DEBUG0:
+                    rospy.loginfo("Filter initialized.")
+                return
 
         # Time difference and old time storage.
         self.dt = self.real_time - self.last_time
@@ -121,6 +136,8 @@ class SensorFilter:
         self.z[2] = atan2(self.T_odom_world2robot[1, 0], self.T_odom_world2robot[0, 0])
 
         if not marker.markers:
+            if self.calibrate:
+                return
             if DEBUG1:
                 rospy.loginfo("No marker detected")
             self.H[3, 0] = 0
@@ -151,29 +168,45 @@ class SensorFilter:
             # Marker's global-position publisher.
             self.global_marker_position.linear.x = T_world2marker[0, 3]
             self.global_marker_position.linear.y = T_world2marker[1, 3]
-            self.global_marker_position.linear.z = T_world2marker[2, 3]
+            self.global_marker_position.angular.z = atan2(T_world2marker[1, 0], T_world2marker[0, 0])
             self.pub_global_marker_position.publish(self.global_marker_position)
+
+            if self.calibrate:
+                self.calibrate = False
+                self.mu[0] = self.z[3]
+                self.mu[1] = self.z[4]
+                self.mu[2] = self.z[5]
+                self.z[0] = self.z[3]
+                self.z[1] = self.z[4]
+                self.z[2] = self.z[5]
 
         # Extended Kalman Filter
         self.ekf()
 
-        # Robot's pose publisher.
-        self.pose_estimate.linear.x = self.mu[0]
-        self.pose_estimate.linear.y = self.mu[1]
-        self.pose_estimate.angular.z = self.mu[2]
-        self.pub_pose.publish(self.pose_estimate)
+        if not self.calibrate:
+            # Robot's pose publisher.
+            self.pose_estimate.linear.x = self.mu[0]
+            self.pose_estimate.linear.y = self.mu[1]
+            self.pose_estimate.angular.z = self.mu[2]
+            self.pub_pose.publish(self.pose_estimate)
 
-        # Odom's global-position publisher.
-        self.global_odom_position.linear.x = self.T_odom_world2robot[0, 3]
-        self.global_odom_position.linear.y = self.T_odom_world2robot[1, 3]
-        self.global_odom_position.linear.z = self.T_odom_world2robot[2, 3]
-        self.pub_global_odom_position.publish(self.global_odom_position)
+            # Model predicted global-position publisher.
+            self.global_model_predicted_position.linear.x = self.mu_storage[0]
+            self.global_model_predicted_position.linear.y = self.mu_storage[1]
+            self.global_model_predicted_position.angular.z = self.mu_storage[2]
+            self.pub_global_model_predicted_position.publish(self.global_model_predicted_position)
 
-        # Update robot pose
-        self.T_world2robot = tf.transformations.euler_matrix(0, 0, self.mu[2], 'sxyz')
-        self.T_world2robot[0, 3] = self.mu[0]
-        self.T_world2robot[1, 3] = self.mu[1]
-        self.T_world2odom = self.T_world2robot.dot(linalg.inv(T_odom2robot))
+            # Odom's global-position publisher.
+            self.global_odom_position.linear.x = self.T_odom_world2robot[0, 3]
+            self.global_odom_position.linear.y = self.T_odom_world2robot[1, 3]
+            self.global_odom_position.angular.z = atan2(self.T_odom_world2robot[1, 0], self.T_odom_world2robot[0, 0])
+            self.pub_global_odom_position.publish(self.global_odom_position)
+
+            # Update robot pose
+            self.T_world2robot = tf.transformations.euler_matrix(0, 0, self.mu[2], 'sxyz')
+            self.T_world2robot[0, 3] = self.mu[0]
+            self.T_world2robot[1, 3] = self.mu[1]
+            self.T_world2odom = self.T_world2robot.dot(linalg.inv(T_odom2robot))
 
         quaternion_world2odom = tf.transformations.quaternion_from_matrix(self.T_world2odom)
         self.br.sendTransform(self.T_world2odom[0:3, 3],
@@ -182,8 +215,8 @@ class SensorFilter:
                               "robot0/odom",
                               "/world")
         # Controller
-        self.cmd_vel.angular.z = 0.15
-        self.cmd_vel.linear.x = 0.1
+        self.cmd_vel.angular.z = 0.5 * cos(0.2 * self.real_time)
+        self.cmd_vel.linear.x = 0.2
         self.pub_cmd.publish(self.cmd_vel)
 
         # Storage
@@ -191,6 +224,7 @@ class SensorFilter:
         self.last_time = self.real_time
         self.u[0] = self.cmd_vel.linear.x
         self.u[1] = self.cmd_vel.angular.z
+        self.z_storage = self.z
 
         # Log information
         if DEBUG0:
@@ -200,45 +234,67 @@ class SensorFilter:
 
         if DEBUG1:
             rospy.loginfo(
-                "X estimate = {0}Y estimate: {1}Orientation estimate: {2}".format(str(self.mu[0]),
-                                                                                  str(self.mu[1]),
-                                                                                  str(self.mu[2] / pi * 180)))
+                "X estimate = {0}Y estimate: {1} Orientation estimate: {2}".format(str(self.mu[0]),
+                                                                                   str(self.mu[1]),
+                                                                                   str(self.mu[2] / pi * 180)))
 
         if DEBUG2:
             rospy.loginfo("x_o" + str(self.z[0]) + ", y_o" + str(self.z[1]) + ", Theta_o" + str(self.z[2] / pi * 180))
             rospy.loginfo("x_m" + str(self.z[3]) + ", y_m" + str(self.z[4]) + ", Theta_m" + str(self.z[5] / pi * 180))
 
-    def prediction_model(self, u, x, dt):
-        g = np.zeros((self.dim_x, 1))
-        g[0] = x[0] + dt * u[0] * cos(x[2])
-        g[1] = x[1] - dt * u[0] * sin(x[2])
-        g[2] = x[2] + dt * u[1]
-        return g
-
     @staticmethod
     def observation_model(x):
         return np.vstack((x, x))
 
-    def jacobian_derivation(self, u, x, dt):
+    @staticmethod
+    def sensor_substract(z1, z2):
+        delta = z1 - z2
+        delta[2] = wraptopi(delta[2])
+        delta[5] = wraptopi(delta[5])
+        return delta
+
+    def prediction_model(self, u, x, dt):
+        g = np.zeros((self.dim_x, 1))
+        if u[1] < self.epsilon:
+            g[0] = x[0] + dt * u[0] * cos(x[2])
+            g[1] = x[1] - dt * u[0] * sin(x[2])
+        else:
+            g[0] = x[0] + u[0] * 1.0 / u[1] * (sin(x[2] + u[1] * dt) - sin(x[2]))
+            g[1] = x[1] + u[0] * 1.0 / u[1] * (cos(x[2]) - cos(x[2] + u[1] * dt))
+
+        g[2] = wraptopi(x[2] + dt * u[1])
+        return g
+
+    def jacobian_prediction_model(self, u, x, dt):
         G = np.eye(self.dim_x)
-        G[0, 2] = - dt * u[0] * sin(x[2])
-        G[1, 2] = - dt * u[0] * cos(x[2])
+        if u[1] < self.epsilon:
+            G[0, 2] = - dt * u[0] * sin(x[2])
+            G[1, 2] = - dt * u[0] * cos(x[2])
+        else:
+            G[0, 2] = u[0] * 1.0 / u[1] * (cos(x[2] + u[1] * dt) - cos(x[2]))
+            G[1, 2] = u[0] * 1.0 / u[1] * (sin(x[2] + u[1] * dt) - sin(x[2]))
         return G
 
     def ekf(self):
         # Update G
-        self.G = self.jacobian_derivation(self.u, self.mu, self.dt)
+        self.G = self.jacobian_prediction_model(self.u, self.mu, self.dt)
 
         # Prediction
         self.mu = self.prediction_model(self.u, self.mu, self.dt)
+        self.mu_storage = self.mu
         self.S = self.G.dot(self.S).dot(self.G.T) + self.R
 
         # Optimal Kalman gain
         optimal_gain = self.S.dot(self.H.T).dot(linalg.inv(self.H.dot(self.S).dot(self.H.T) + self.Q))
 
         # Measurement update
-        self.mu = self.mu + optimal_gain.dot(self.z - self.observation_model(self.mu))
+        self.mu = self.mu + optimal_gain.dot(self.sensor_substract(self.z, self.observation_model(self.mu)))
         self.S = (np.eye(self.dim_x) - optimal_gain.dot(self.H)).dot(self.S)
+
+
+def wraptopi(angle):
+    angle = (angle + pi) % (2 * pi) - pi
+    return angle
 
 
 def main():
