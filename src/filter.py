@@ -9,11 +9,22 @@ from scipy import linalg
 from ar_track_alvar_msgs.msg import AlvarMarkers
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import Path
+from nav_msgs.srv import GetMap
+from geometry_msgs.msg import PoseStamped
 
-from math import sin, cos, pi, asin, atan2, sqrt, fabs
+from math import sin, cos, pi, atan2, sqrt, fabs, radians
 
-# Enable/Disable debug information
+import matplotlib.pyplot as plt
+import a_star
+import reeds_shepp
+
+# Enable/Disable
 DEBUG = False
+show_animation = True
+is_a_star = False
+is_reeds_sheep = True
 
 class TicToc:
     """
@@ -55,7 +66,6 @@ class TicToc:
         else:
             return self.named[name]
 
-
 class Robot:
     def __init__(self):
         # Ros Publisher
@@ -74,6 +84,7 @@ class Robot:
         self.global_odom_position = Twist()
         self.global_marker_position = Twist()
         self.pose = Twist()
+        self.goal_pose = Twist()
 
         # Matrix transforms
         self.T_world2cam = tf.transformations.euler_matrix(0, pi, pi / 2, 'sxyz')
@@ -91,6 +102,11 @@ class Robot:
         # Controller variables
         self.u = np.zeros((2, 1))
         self.i = 0
+
+        # Path
+        self.path = Path()
+        self.path_goal_seq = 0
+        self.idle = True
 
     def global_odom(self, odom):
         quaternion_odom2robot = (
@@ -171,14 +187,63 @@ class Robot:
         if publish:
             self.pub_global_model_predicted_pose.publish(self.global_model_predicted_pose)
 
+    @staticmethod
+    def wraptopi(angle):
+        angle = (angle + pi) % (2 * pi) - pi
+        return angle
+
     def controller(self):
-        self.i += 1
-        self.cmd_vel.angular.z = 0.4 * sin(0.006 * self.i)
-        self.cmd_vel.linear.x = 0.2
+        if not self.idle:
+            ## Set the goal
+            quaternion_world2goal = (
+                self.path.poses[-1].pose.orientation.x,
+                self.path.poses[-1].pose.orientation.y,
+                self.path.poses[-1].pose.orientation.z,
+                self.path.poses[-1].pose.orientation.w)
+            self.T_world2goal = tf.transformations.quaternion_matrix(quaternion_world2goal)
+
+            self.goal_pose.angular.z = atan2(self.T_world2goal[1, 0], self.T_world2goal[0, 0])
+            self.goal_pose.linear.x = self.path.poses[-1].pose.position.x
+            self.goal_pose.linear.y = self.path.poses[-1].pose.position.y
+
+        ## Go to the goal
+        # k_rho > 0 ; k_alpha > k_rho ; k_beta < 0
+        k_rho = 0.3 / pi
+        k_alpha = 1.0 / pi
+        k_beta = -0.0
+
+        dx = self.goal_pose.linear.x - self.pose.linear.x
+        dy = self.goal_pose.linear.y - self.pose.linear.y
+        rho = sqrt(dx ** 2 + dy ** 2)
+        alpha = self.wraptopi(atan2(dy, dx) - self.pose.angular.z)
+        beta = - self.goal_pose.angular.z
+
+        self.cmd_vel.angular.z = k_alpha * alpha + k_beta * beta
+
+        self.cmd_vel.linear.x = k_rho * rho
+        if rho < 0.2:
+            self.cmd_vel.linear.x = 0
+
         self.pub_cmd.publish(self.cmd_vel)
+
         self.u[0] = self.cmd_vel.linear.x
         self.u[1] = self.cmd_vel.angular.z
+
+        print "rho"
+        print rho
+        print "alpha"
+        print alpha / pi * 180
+        print "beta"
+        print beta / pi * 180
+        print "theta"
+        print self.pose.angular.z / pi * 180
+
         return self.u
+
+    def goal_cb(self, path):
+        self.path = path
+        self.path_goal_seq = 0
+        self.idle = False
 
 
 class SensorsFilter:
@@ -341,11 +406,141 @@ class SensorsFilter:
         self.S = (np.eye(self.dim_x) - optimal_gain.dot(self.H)).dot(self.S)
 
 
+class GlobalPathPlanner:
+    def __init__(self):
+        self.map = OccupancyGrid()
+        self.pub_global_path = rospy.Publisher('/robot0/global_path', Path, queue_size=1)
+        self.path = Path()
+
+    def goal_cb(self, goal):
+        quaternion_world2goal = (
+            goal.pose.orientation.x,
+            goal.pose.orientation.y,
+            goal.pose.orientation.z,
+            goal.pose.orientation.w)
+        euler_angle = tf.transformations.euler_from_quaternion(quaternion_world2goal, axes='sxyz')
+        rospy.loginfo("Goal set to x = {0} [m], y = {1} [m], yaw = {2} [deg])"
+                      .format(str(goal.pose.position.x), str(goal.pose.position.y), str(euler_angle[2]/pi*180)))
+
+        # A star algorithm
+        if is_a_star:
+            sx = 0.0  # [m]
+            sy = 0.0  # [m]
+            gx = goal.pose.position.x  # [m]
+            gy = goal.pose.position.y  # [m]
+
+            grid_size = self.map.info.resolution   # [m]
+            offset_x = self.map.info.origin.position.x
+            offset_y = self.map.info.origin.position.y
+            robot_size = 0.5  # [m]
+
+            ox, oy = [], []
+
+            for i in range(self.map.info.height):
+                for j in range(self.map.info.width):
+                    if self.map.data[i * self.map.info.width + j] > 0:
+                        ox.append(j*grid_size + offset_x)
+                        oy.append(i*grid_size + offset_y)
+
+            if show_animation:
+                plt.plot(ox, oy, ".k")
+                plt.plot(sx, sy, "xr")
+                plt.plot(gx, gy, "xb")
+                plt.grid(True)
+                plt.axis("equal")
+
+            rx, ry = a_star.a_star_planning(sx, sy, gx, gy, ox, oy, grid_size, robot_size)
+            ryaw = []
+            for i in range(len(rx)-1):
+                ryaw.append(atan2(ry[i]-ry[i+1], rx[i]-rx[i+1]))
+            ryaw.append(ryaw[-1])
+
+            if show_animation:
+                plt.plot(rx, ry, "-r")
+                plt.show()
+
+        if is_reeds_sheep:
+            start_x = 0.0  # [m]
+            start_y = 0.0  # [m]
+            start_yaw = radians(0.0)  # [rad]
+
+            end_x = goal.pose.position.x  # [m]
+            end_y = goal.pose.position.y  # [m]
+            end_yaw = euler_angle[2]  # [rad]
+
+            curvature = 1.0
+            step_size = 0.1
+
+            rx, ry, ryaw, mode, clen = reeds_shepp.reeds_shepp_path_planning(
+                start_x, start_y, start_yaw, end_x, end_y, end_yaw, curvature, step_size)
+
+            if show_animation:
+                plt.cla()
+                plt.plot(rx, ry, label="final course " + str(mode))
+
+                # plotting
+                reeds_shepp.plot_arrow(start_x, start_y, start_yaw)
+                reeds_shepp.plot_arrow(end_x, end_y, end_yaw)
+
+                plt.legend()
+                plt.grid(True)
+                plt.xlim((min(start_x, end_x) - 3, max(start_x, end_x) + 3))
+                plt.ylim((min(start_y, end_y) - 3, max(start_y, end_y) + 3))
+                plt.show()
+
+        for ix, iy, iyaw in zip(rx, ry, ryaw):
+            quaternion_path = tf.transformations.quaternion_from_euler(0, 0, iyaw, axes='sxyz')
+            pose = PoseStamped()
+            pose.header.frame_id = "world"
+            pose.pose.position.x = float(ix)
+            pose.pose.position.y = float(iy)
+            pose.pose.position.z = 0.0  # Debug: float(iyaw/pi*180)
+            pose.pose.orientation.x = float(quaternion_path[0])
+            pose.pose.orientation.y = float(quaternion_path[1])
+            pose.pose.orientation.z = float(quaternion_path[2])
+            pose.pose.orientation.w = float(quaternion_path[3])
+            pose.header.seq = self.path.header.seq + 1
+            self.path.header.frame_id = "world"
+            self.path.header.stamp = rospy.Time.now()
+            pose.header.stamp = self.path.header.stamp
+            self.path.poses.append(pose)
+            self.pub_global_path.publish(self.path)
+
+        self.path = Path()
+
+    def tf_cb(self, event):
+        # Send transform between /world and /map
+        br = tf.TransformBroadcaster()
+        br.sendTransform((0, 0, 0),
+                         (0, 0, 0, 1),
+                         rospy.Time.now(),
+                         "/map",
+                         "/world")
+
+
 def main():
     # Init gpss_filter node.
     rospy.init_node("gpss_filter")
 
-    # Add filter object
+    ## Create global path planner object
+    gpp = GlobalPathPlanner()
+
+    # Read static map
+    rospy.wait_for_service('static_map')
+
+    try:
+        map_server = rospy.ServiceProxy('static_map', GetMap)
+        gpp.map = map_server().map
+    except rospy.ServiceException, e:
+        print "Service call failed: %s" % e
+
+    # Timer to refresh TF transform between world and map
+    rospy.Timer(rospy.Duration(1.0 / 4), gpp.tf_cb)
+
+    # Subscribe to goal topic published by RVIZ
+    rospy.Subscriber("/move_base_simple/goal", PoseStamped, gpp.goal_cb)
+
+    ## Add filter object
     sf = SensorsFilter()
 
     # Subscribe to Odometry and ALVAR tag topics.
@@ -355,6 +550,9 @@ def main():
     # Synchronize topics with message_filter.
     ts = message_filters.ApproximateTimeSynchronizer([odom_sub, marker_sub], 1, 0.010, allow_headerless=False)
     ts.registerCallback(sf.fusion)
+
+    #rospy.Subscriber("/move_base_simple/goal", PoseStamped, sf.robot.goal_cb)
+    rospy.Subscriber("/robot0/global_path", Path, sf.robot.goal_cb)
 
     # Blocks until ROS node is shutdown.
     rospy.spin()
