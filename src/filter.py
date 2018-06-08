@@ -193,7 +193,7 @@ class Robot:
         return angle
 
     def controller(self):
-        if not self.idle:
+        if not self.idle and self.path_goal_seq > len(self.path.poses):
             ## Set the goal
             quaternion_world2goal = (
                 self.path.poses[-1].pose.orientation.x,
@@ -223,6 +223,7 @@ class Robot:
         self.cmd_vel.linear.x = k_rho * rho
         if rho < 0.2:
             self.cmd_vel.linear.x = 0
+            self.path_goal_seq += 5
 
         self.pub_cmd.publish(self.cmd_vel)
 
@@ -242,7 +243,7 @@ class Robot:
 
     def goal_cb(self, path):
         self.path = path
-        self.path_goal_seq = 0
+        self.path_goal_seq = 5
         self.idle = False
 
 
