@@ -22,9 +22,11 @@ import reeds_shepp
 
 # Enable/Disable
 DEBUG = False
+controller_debug = False
 show_animation = True
 is_a_star = False
 is_reeds_sheep = True
+
 
 class TicToc:
     """
@@ -66,11 +68,11 @@ class TicToc:
         else:
             return self.named[name]
 
+
 class Robot:
     def __init__(self):
         # Ros Publisher
         self.pub_global_odom_position = rospy.Publisher('/robot0/global_odom_position', Twist, queue_size=1)
-        self.pub_cmd = rospy.Publisher('/robot0/diff_drive_controller/cmd_vel', Twist, queue_size=1)
         self.pub_global_model_predicted_pose = rospy.Publisher('/robot0/global_model_predicted_position', Twist, queue_size=1)
         self.pub_global_marker_position = rospy.Publisher('/robot0/global_marker_position', Twist, queue_size=1)
         self.pub_pose = rospy.Publisher('/robot0/pose_estimate', Twist, queue_size=1)
@@ -79,12 +81,10 @@ class Robot:
         self.br = tf.TransformBroadcaster()
 
         # ROS variables
-        self.cmd_vel = Twist()
         self.global_model_predicted_pose = Twist()
         self.global_odom_position = Twist()
         self.global_marker_position = Twist()
         self.pose = Twist()
-        self.goal_pose = Twist()
 
         # Matrix transforms
         self.T_world2cam = tf.transformations.euler_matrix(0, pi, pi / 2, 'sxyz')
@@ -99,14 +99,8 @@ class Robot:
         self.odom_w2r = np.zeros((3, 1))
         self.marker_w2r = np.zeros((3, 1))
 
-        # Controller variables
-        self.u = np.zeros((2, 1))
-        self.i = 0
-
-        # Path
-        self.path = Path()
-        self.path_goal_seq = 0
-        self.idle = True
+        # Controller of the robot
+        self.controller = Controller()
 
     def global_odom(self, odom):
         quaternion_odom2robot = (
@@ -187,65 +181,6 @@ class Robot:
         if publish:
             self.pub_global_model_predicted_pose.publish(self.global_model_predicted_pose)
 
-    @staticmethod
-    def wraptopi(angle):
-        angle = (angle + pi) % (2 * pi) - pi
-        return angle
-
-    def controller(self):
-        if not self.idle and self.path_goal_seq > len(self.path.poses):
-            ## Set the goal
-            quaternion_world2goal = (
-                self.path.poses[-1].pose.orientation.x,
-                self.path.poses[-1].pose.orientation.y,
-                self.path.poses[-1].pose.orientation.z,
-                self.path.poses[-1].pose.orientation.w)
-            self.T_world2goal = tf.transformations.quaternion_matrix(quaternion_world2goal)
-
-            self.goal_pose.angular.z = atan2(self.T_world2goal[1, 0], self.T_world2goal[0, 0])
-            self.goal_pose.linear.x = self.path.poses[-1].pose.position.x
-            self.goal_pose.linear.y = self.path.poses[-1].pose.position.y
-
-        ## Go to the goal
-        # k_rho > 0 ; k_alpha > k_rho ; k_beta < 0
-        k_rho = 0.3 / pi
-        k_alpha = 1.0 / pi
-        k_beta = -0.0
-
-        dx = self.goal_pose.linear.x - self.pose.linear.x
-        dy = self.goal_pose.linear.y - self.pose.linear.y
-        rho = sqrt(dx ** 2 + dy ** 2)
-        alpha = self.wraptopi(atan2(dy, dx) - self.pose.angular.z)
-        beta = - self.goal_pose.angular.z
-
-        self.cmd_vel.angular.z = k_alpha * alpha + k_beta * beta
-
-        self.cmd_vel.linear.x = k_rho * rho
-        if rho < 0.2:
-            self.cmd_vel.linear.x = 0
-            self.path_goal_seq += 5
-
-        self.pub_cmd.publish(self.cmd_vel)
-
-        self.u[0] = self.cmd_vel.linear.x
-        self.u[1] = self.cmd_vel.angular.z
-
-        print "rho"
-        print rho
-        print "alpha"
-        print alpha / pi * 180
-        print "beta"
-        print beta / pi * 180
-        print "theta"
-        print self.pose.angular.z / pi * 180
-
-        return self.u
-
-    def goal_cb(self, path):
-        self.path = path
-        self.path_goal_seq = 5
-        self.idle = False
-
 
 class SensorsFilter:
     def __init__(self):
@@ -255,7 +190,7 @@ class SensorsFilter:
         self.dt = 0
         self.t = TicToc()
 
-        # Robot object for control and TF transforms.
+        # Robot object.
         self.robot = Robot()
 
         # Model variable
@@ -292,9 +227,7 @@ class SensorsFilter:
                 return
             else:
                 self.initialize = False
-                if DEBUG:
-                    rospy.loginfo("Filter initialized.")
-                return
+                rospy.loginfo("Filter initialized.")
 
         # Time difference and time storage.
         self.dt = self.t.get(1) - self.t.get(0)
@@ -340,7 +273,7 @@ class SensorsFilter:
         self.robot.world2odom(self.mu)
 
         # Controller
-        self.u = self.robot.controller()
+        self.u = self.robot.controller.ctrl(self.robot)
 
         # Storage
         self.z_storage = self.z
@@ -407,11 +340,156 @@ class SensorsFilter:
         self.S = (np.eye(self.dim_x) - optimal_gain.dot(self.H)).dot(self.S)
 
 
+class Controller:
+    def __init__(self):
+        # Controller variables
+        self.u = np.zeros((2, 1))
+        self.i = 0
+        self.forward = True
+
+        # Path
+        self.path = Path()
+        self.goal_i = 0
+        self.seq_change = []
+        self.seq_is_reverse = []
+        self.idle = True
+        self.change_subgoal = True
+        self.is_reverse = False
+
+        # ROS variable
+        self.goal_pose = Twist()
+        self.cmd_vel = Twist()
+
+        # Command publisher
+        self.pub_cmd = rospy.Publisher('/robot0/diff_drive_controller/cmd_vel', Twist, queue_size=1)
+
+    def ctrl(self, robot):
+        dx = 0.0
+        rho = 0.0
+        dy = 0.0
+        phi = 0.0
+
+        if not self.idle:
+            i_max = len(self.path.poses)
+            if self.seq_change and self.change_subgoal:
+                i_max = self.seq_change.pop()
+                self.change_subgoal = False
+
+            for i in range(self.goal_i, i_max - 2):
+                dx = self.path.poses[i].pose.position.x - robot.pose.linear.x
+                dy = self.path.poses[i].pose.position.y - robot.pose.linear.y
+                rho = sqrt(dx ** 2 + dy ** 2)
+                if rho >= 0.2:
+                    break
+
+            self.goal_i = i
+            self.is_reverse = self.seq_is_reverse[i]
+
+            print i
+            print self.is_reverse
+            print ""
+
+            quaternion_world2goal = (
+                self.path.poses[i].pose.orientation.x,
+                self.path.poses[i].pose.orientation.y,
+                self.path.poses[i].pose.orientation.z,
+                self.path.poses[i].pose.orientation.w)
+            euler_world2goal = tf.transformations.euler_from_quaternion(quaternion_world2goal, axes='sxyz')
+            phi = euler_world2goal[2]
+
+        ## Go to the goal
+        # k_rho > 0 ; k_alpha > k_rho ; k_beta < 0
+        k_rho = 0.3 / pi
+        k_alpha = 1.0 / pi
+        k_beta = - 1.5 / pi
+
+        theta = robot.pose.angular.z
+        alpha = self.wraptopi(atan2(dy, dx) - theta)
+        beta = self.wraptopi(phi - alpha - theta)
+
+        if self.is_reverse:
+            self.cmd_vel.angular.z = k_alpha * self.wraptopi(alpha-pi) + k_beta * self.wraptopi(beta-pi)
+            self.cmd_vel.linear.x = - k_rho * rho
+        else:
+            self.cmd_vel.angular.z = k_alpha * alpha + k_beta * beta
+            self.cmd_vel.linear.x = k_rho * rho
+
+        if rho < 0.01:
+            self.change_subgoal = True
+            self.cmd_vel.linear.x = 0.0
+            self.cmd_vel.angular.z = 0.0
+
+        self.pub_cmd.publish(self.cmd_vel)
+
+        self.u[0] = self.cmd_vel.linear.x
+        self.u[1] = self.cmd_vel.angular.z
+
+        if controller_debug:
+            print "rho"
+            print rho
+            print "alpha"
+            print alpha / pi * 180
+            print "beta"
+            print beta / pi * 180
+            print "theta"
+            print robot.pose.angular.z / pi * 180
+
+        return self.u
+
+    def goal_cb(self, path):
+        self.path = path
+        self.goal_i = 0
+        self.idle = False
+        self.seq_change = []
+        self.seq_is_reverse = []
+
+        if len(self.path.poses) > 3:
+            # Detect change of direction
+            for i in range(len(self.path.poses) - 2):
+                byaw0 = atan2(self.path.poses[i+1].pose.position.y - self.path.poses[i].pose.position.y,
+                              self.path.poses[i+1].pose.position.x - self.path.poses[i].pose.position.x)
+                byaw1 = atan2(self.path.poses[i+2].pose.position.y - self.path.poses[i+1].pose.position.y,
+                              self.path.poses[i+2].pose.position.x - self.path.poses[i+1].pose.position.x)
+                if abs(self.wraptopi(byaw1 - byaw0)) > pi / 2:
+                    self.seq_change.append(i+1)
+
+            for i in range(len(self.path.poses) - 1):
+                byaw0 = atan2(self.path.poses[i+1].pose.position.y - self.path.poses[i].pose.position.y,
+                              self.path.poses[i+1].pose.position.x - self.path.poses[i].pose.position.x)
+
+                quaternion_world2goal = (
+                    self.path.poses[i].pose.orientation.x,
+                    self.path.poses[i].pose.orientation.y,
+                    self.path.poses[i].pose.orientation.z,
+                    self.path.poses[i].pose.orientation.w)
+                euler_world2goal = tf.transformations.euler_from_quaternion(quaternion_world2goal, axes='sxyz')
+                phi = euler_world2goal[2]
+
+                if abs(self.wraptopi(phi - byaw0)) > pi / 2:
+                    self.seq_is_reverse.append(True)
+                else:
+                    self.seq_is_reverse.append(False)
+            self.seq_is_reverse.append(self.seq_is_reverse[-1])
+
+    @staticmethod
+    def wraptopi(angle):
+        angle = (angle + pi) % (2 * pi) - pi
+        return angle
+
+
 class GlobalPathPlanner:
     def __init__(self):
         self.map = OccupancyGrid()
         self.pub_global_path = rospy.Publisher('/robot0/global_path', Path, queue_size=1)
         self.path = Path()
+
+        # Robot object.
+        self.robot = Robot()
+
+    @staticmethod
+    def wraptopi(angle):
+        angle = (angle + pi) % (2 * pi) - pi
+        return angle
 
     def goal_cb(self, goal):
         quaternion_world2goal = (
@@ -425,8 +503,8 @@ class GlobalPathPlanner:
 
         # A star algorithm
         if is_a_star:
-            sx = 0.0  # [m]
-            sy = 0.0  # [m]
+            sx = self.robot.pose.position.x  # [m]
+            sy = self.robot.pose.position.y  # [m]
             gx = goal.pose.position.x  # [m]
             gy = goal.pose.position.y  # [m]
 
@@ -461,9 +539,9 @@ class GlobalPathPlanner:
                 plt.show()
 
         if is_reeds_sheep:
-            start_x = 0.0  # [m]
-            start_y = 0.0  # [m]
-            start_yaw = radians(0.0)  # [rad]
+            start_x = self.robot.pose.linear.x  # [m]
+            start_y = self.robot.pose.linear.y  # [m]
+            start_yaw = self.robot.pose.angular.z  # [rad]
 
             end_x = goal.pose.position.x  # [m]
             end_y = goal.pose.position.y  # [m]
@@ -473,13 +551,22 @@ class GlobalPathPlanner:
             step_size = 0.1
 
             rx, ry, ryaw, mode, clen = reeds_shepp.reeds_shepp_path_planning(
-                start_x, start_y, start_yaw, end_x, end_y, end_yaw, curvature, step_size)
+                start_x[0], start_y[0], start_yaw[0], end_x, end_y, end_yaw, curvature, step_size)
+
+            # Detect backward direction
+            bx = []
+            by = []
+            for i in range(len(rx) - 1):
+                byaw = atan2(ry[i + 1] - ry[i], rx[i + 1] - rx[i])
+                delta_angle = self.wraptopi(byaw - ryaw[i])
+                if abs(delta_angle) > pi / 2:
+                    bx.append(rx[i])
+                    by.append(ry[i])
 
             if show_animation:
                 plt.cla()
                 plt.plot(rx, ry, label="final course " + str(mode))
-
-                # plotting
+                plt.plot(bx, by, "or")
                 reeds_shepp.plot_arrow(start_x, start_y, start_yaw)
                 reeds_shepp.plot_arrow(end_x, end_y, end_yaw)
 
@@ -523,8 +610,12 @@ def main():
     # Init gpss_filter node.
     rospy.init_node("gpss_filter")
 
+    # Robot object definition.
+    robot = Robot()
+
     ## Create global path planner object
     gpp = GlobalPathPlanner()
+    gpp.robot = robot
 
     # Read static map
     rospy.wait_for_service('static_map')
@@ -543,6 +634,7 @@ def main():
 
     ## Add filter object
     sf = SensorsFilter()
+    sf.robot = robot
 
     # Subscribe to Odometry and ALVAR tag topics.
     odom_sub = message_filters.Subscriber("/robot0/diff_drive_controller/odom", Odometry)
@@ -553,7 +645,7 @@ def main():
     ts.registerCallback(sf.fusion)
 
     #rospy.Subscriber("/move_base_simple/goal", PoseStamped, sf.robot.goal_cb)
-    rospy.Subscriber("/robot0/global_path", Path, sf.robot.goal_cb)
+    rospy.Subscriber("/robot0/global_path", Path, robot.controller.goal_cb)
 
     # Blocks until ROS node is shutdown.
     rospy.spin()
