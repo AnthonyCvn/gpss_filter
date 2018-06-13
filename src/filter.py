@@ -14,7 +14,7 @@ from nav_msgs.msg import Path
 from nav_msgs.srv import GetMap
 from geometry_msgs.msg import PoseStamped
 
-from math import sin, cos, pi, atan2, sqrt, fabs, radians
+from math import sin, cos, pi, atan2, sqrt, fabs
 
 import matplotlib.pyplot as plt
 import a_star
@@ -350,6 +350,7 @@ class Controller:
         # Path
         self.path = Path()
         self.goal_i = 0
+        self.i_max = 0
         self.seq_change = []
         self.seq_is_reverse = []
         self.idle = True
@@ -364,30 +365,40 @@ class Controller:
         self.pub_cmd = rospy.Publisher('/robot0/diff_drive_controller/cmd_vel', Twist, queue_size=1)
 
     def ctrl(self, robot):
+        ## Parameters
+        # Lyapunnov stability for: k_rho > 0 ; k_alpha > k_rho ; k_beta < 0
+        k_rho = 0.7 / pi
+        k_alpha = 1.0 / pi
+        k_beta = - 1.0 / pi
         dx = 0.0
         rho = 0.0
         dy = 0.0
         phi = 0.0
 
+        # print "change subgoal: " + str(self.change_subgoal)
+        # print self.seq_change
+
+        ## Define next goal
         if not self.idle:
-            i_max = len(self.path.poses)
             if self.seq_change and self.change_subgoal:
-                i_max = self.seq_change.pop()
+                self.i_max = self.seq_change.pop(0)
                 self.change_subgoal = False
 
-            for i in range(self.goal_i, i_max - 2):
+            for i in range(self.goal_i, self.i_max):
                 dx = self.path.poses[i].pose.position.x - robot.pose.linear.x
                 dy = self.path.poses[i].pose.position.y - robot.pose.linear.y
                 rho = sqrt(dx ** 2 + dy ** 2)
-                if rho >= 0.2:
+                if rho >= 0.4:
                     break
 
             self.goal_i = i
             self.is_reverse = self.seq_is_reverse[i]
 
-            print i
-            print self.is_reverse
-            print ""
+            # print "i max: " + str(self.i_max)
+            # print "goal i: " + str(i)
+            # print "is reverse: " + str(self.is_reverse)
+            # print "rho : " + str(rho)
+            # print ""
 
             quaternion_world2goal = (
                 self.path.poses[i].pose.orientation.x,
@@ -398,26 +409,22 @@ class Controller:
             phi = euler_world2goal[2]
 
         ## Go to the goal
-        # k_rho > 0 ; k_alpha > k_rho ; k_beta < 0
-        k_rho = 0.3 / pi
-        k_alpha = 1.0 / pi
-        k_beta = - 1.5 / pi
-
-        theta = robot.pose.angular.z
-        alpha = self.wraptopi(atan2(dy, dx) - theta)
-        beta = self.wraptopi(phi - alpha - theta)
-
-        if self.is_reverse:
-            self.cmd_vel.angular.z = k_alpha * self.wraptopi(alpha-pi) + k_beta * self.wraptopi(beta-pi)
-            self.cmd_vel.linear.x = - k_rho * rho
-        else:
-            self.cmd_vel.angular.z = k_alpha * alpha + k_beta * beta
-            self.cmd_vel.linear.x = k_rho * rho
-
         if rho < 0.01:
             self.change_subgoal = True
             self.cmd_vel.linear.x = 0.0
             self.cmd_vel.angular.z = 0.0
+        else:
+            theta = robot.pose.angular.z
+            alpha = self.wraptopi(atan2(dy, dx) - theta)
+            beta = self.wraptopi(phi - alpha - theta)
+
+            if self.is_reverse:
+                self.cmd_vel.angular.z = k_alpha * self.wraptopi(alpha-pi) + k_beta * self.wraptopi(beta-pi)
+                self.cmd_vel.linear.x = - k_rho * rho
+            else:
+                self.cmd_vel.angular.z = k_alpha * alpha + k_beta * beta
+                self.cmd_vel.linear.x = k_rho * rho
+
 
         self.pub_cmd.publish(self.cmd_vel)
 
@@ -440,6 +447,7 @@ class Controller:
         self.path = path
         self.goal_i = 0
         self.idle = False
+        self.change_subgoal = True
         self.seq_change = []
         self.seq_is_reverse = []
 
@@ -471,6 +479,12 @@ class Controller:
                     self.seq_is_reverse.append(False)
             self.seq_is_reverse.append(self.seq_is_reverse[-1])
 
+            for i in self.seq_change:
+                self.seq_is_reverse[i] = self.seq_is_reverse[i-1]
+
+            self.i_max = len(self.path.poses)-1
+            self.seq_change.append(self.i_max)
+
     @staticmethod
     def wraptopi(angle):
         angle = (angle + pi) % (2 * pi) - pi
@@ -481,7 +495,10 @@ class GlobalPathPlanner:
     def __init__(self):
         self.map = OccupancyGrid()
         self.pub_global_path = rospy.Publisher('/robot0/global_path', Path, queue_size=1)
+        self.pub_path_graph = rospy.Publisher('/robot0/path_graph', Twist, queue_size=100)
         self.path = Path()
+        self.path_point = Twist()
+
 
         # Robot object.
         self.robot = Robot()
@@ -548,7 +565,7 @@ class GlobalPathPlanner:
             end_yaw = euler_angle[2]  # [rad]
 
             curvature = 1.0
-            step_size = 0.1
+            step_size = 0.05
 
             rx, ry, ryaw, mode, clen = reeds_shepp.reeds_shepp_path_planning(
                 start_x[0], start_y[0], start_yaw[0], end_x, end_y, end_yaw, curvature, step_size)
@@ -592,7 +609,14 @@ class GlobalPathPlanner:
             self.path.header.stamp = rospy.Time.now()
             pose.header.stamp = self.path.header.stamp
             self.path.poses.append(pose)
-            self.pub_global_path.publish(self.path)
+
+            # Publish path for graphics
+            self.path_point.linear.x = ix
+            self.path_point.linear.y = iy
+            self.path_point.linear.z = iyaw
+            self.pub_path_graph.publish(self.path_point)
+
+        self.pub_global_path.publish(self.path)
 
         self.path = Path()
 
